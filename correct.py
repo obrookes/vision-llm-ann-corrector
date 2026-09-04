@@ -4,7 +4,8 @@
         --frames-dir $SCRATCH/frames --masks-dir $SCRATCH/masks --out-dir $SCRATCH/masks_v2 \\
         --checkpoint $SCRATCH/weights/sam3/sam3-safari-pos.pt \\
         [--min-confidence high|low] [--text-prompt person] [--iou-match 0.5] [--dilate 0.10] \\
-        [--log corrections.jsonl] [--limit N] [--dry-run] [--fake] [--device cuda]
+        [--log corrections.jsonl] [--limit N] [--dry-run] [--fake] [--device cuda] \\
+        [--passthrough-manifest manifest.txt]
 
 Reads one worklist line per frame (see vision-llm-ann-verifier-correction's tools/worklist.py for
 the format: `image`, `masks_json`, `actions` = [{"type": "resegment", "idx", "issue"} |
@@ -25,6 +26,16 @@ the format: `image`, `masks_json`, `actions` = [{"type": "resegment", "idx", "is
 
 Resumable: a frame whose `<out-dir>/<stem>_masks.json` already exists is skipped without opening
 the image or the model. Never writes to --masks-dir (the input files).
+
+`--passthrough-manifest` (optional, run after the worklist pass): given a manifest of frame image
+paths (e.g. the same manifest a verifier re-verify pass will use), for every stem listed there that
+has no `<out-dir>/<stem>_masks.json` yet (i.e. it wasn't in --worklist, or --worklist has no line
+for it -- a frame with no flagged issues) copies its original masks through unchanged, re-indexed
+with `provenance: {"source": "original"}` per instance, same as an untouched worklist instance.
+Lets a re-verify pass that reads a single --masks-dir see every sampled frame, not just corrected
+ones. Runs with no SAM3/segmenter needed (skips straight past `build_segmenter`), so this step is
+safe to run on the login node, or piggy-backed on any array task -- but only run it once (not once
+per array shard) to avoid redundant writes.
 """
 
 from __future__ import annotations
@@ -248,6 +259,20 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
     return out_instances, log_entry
 
 
+def passthrough_masks(masks_json_path: Path) -> list[dict]:
+    """Copy every instance in masks_json_path through unchanged (same mask/RLE), tagged with
+    provenance {"source": "original"}, re-indexed 0..N-1 -- same shape process_frame's "untouched"
+    instances get, for a frame with no worklist actions at all."""
+    instances = load_instances(masks_json_path)
+    out = [
+        build_output_instance(inst["mask"], {"source": "original", "orig_idx": inst["instance_idx"]})
+        for inst in instances
+    ]
+    for i, inst in enumerate(out):
+        inst["instance_idx"] = i
+    return out
+
+
 def iter_worklist(path: Path, limit=None):
     n = 0
     with open(path) as f:
@@ -291,6 +316,10 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=None, help="process at most N worklist rows")
     ap.add_argument("--dry-run", action="store_true", help="run the model and compute corrections but do not write <out-dir> or --log")
     ap.add_argument("--fake", action="store_true", help="use segmenter.FakeSegmenter instead of SAM3 (no torch/sam3 import; for tests/dry runs on the login node)")
+    ap.add_argument("--passthrough-manifest",
+                     help="manifest of frame image paths; after the worklist pass, copy original masks "
+                          "unchanged into --out-dir for any listed stem that --worklist didn't produce "
+                          "an output for (no SAM3 needed -- run once, not once per array shard)")
     args = ap.parse_args(argv)
 
     out_dir = Path(args.out_dir)
@@ -351,6 +380,33 @@ def main(argv=None):
         f"skipped_confidence={n_skipped_confidence} errors={n_error}",
         file=sys.stderr,
     )
+
+    if args.passthrough_manifest:
+        n_pass_written = n_pass_skipped = n_pass_error = 0
+        with open(args.passthrough_manifest) as f:
+            manifest_lines = [line.strip() for line in f if line.strip()]
+        for line in manifest_lines:
+            image_path = Path(line)
+            stem = image_path.stem
+            out_path = out_dir / f"{stem}_masks.json"
+            if out_path.exists():
+                n_pass_skipped += 1
+                continue
+            masks_json_path = Path(args.masks_dir) / f"{stem}_masks.json" if args.masks_dir else None
+            if masks_json_path is None or not masks_json_path.exists():
+                print(f"correct.py: passthrough: no masks_json for {stem}, skipping", file=sys.stderr)
+                n_pass_error += 1
+                continue
+            out_instances = passthrough_masks(masks_json_path)
+            if not args.dry_run:
+                with open(out_path, "w") as f:
+                    json.dump(out_instances, f)
+            n_pass_written += 1
+        print(
+            f"correct.py: passthrough written={n_pass_written} skipped_exists={n_pass_skipped} "
+            f"errors={n_pass_error}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
