@@ -184,8 +184,13 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
 
         elif atype == "add":
             box_norm = action.get("box")
-            if not box_norm or len(box_norm) != 4:
-                actions_log.append({"type": "add", "result": "bad_box"})
+            x0n, y0n, x1n, y1n = box_norm if box_norm and len(box_norm) == 4 else (None, None, None, None)
+            # A VLM occasionally emits a degenerate/backwards box (e.g. a person at the frame's
+            # right edge described as x0=1.0, x1=0.3): x1<=x0 or y1<=y0 makes a negative-size
+            # xywh, which fails an unmessaged `assert` deep in SAM3's add_prompt and would
+            # otherwise abort the whole frame (including any other, valid actions on it).
+            if x0n is None or not (0.0 <= x0n < x1n <= 1.0 and 0.0 <= y0n < y1n <= 1.0):
+                actions_log.append({"type": "add", "box": box_norm, "result": "bad_box"})
                 continue
             box_px = xyxy_norm_to_px(box_norm, width, height)
 
