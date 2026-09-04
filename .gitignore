@@ -1,0 +1,6 @@
+outputs/
+*.jsonl
+!tests/**/*.jsonl
+__pycache__/
+*.pyc
+.pytest_cache/
