@@ -4,6 +4,7 @@
         --frames-dir $SCRATCH/frames --masks-dir $SCRATCH/masks --out-dir $SCRATCH/masks_v2 \\
         --checkpoint $SCRATCH/weights/sam3/sam3-safari-pos.pt \\
         [--min-confidence high|low] [--text-prompt person] [--iou-match 0.5] [--dilate 0.10] \\
+        [--keep-ids] [--rle-format compressed|intlist] \\
         [--log corrections.jsonl] [--limit N] [--dry-run] [--fake] [--device cuda] \\
         [--passthrough-manifest manifest.txt]
 
@@ -22,7 +23,9 @@ the format: `image`, `masks_json`, `actions` = [{"type": "resegment", "idx", "is
      else a box prompt on the old mask's bbox dilated by --dilate, replacing the instance.
   5. Untouched instances are copied unchanged (identical RLE). Every output instance carries a
      `"provenance"` field; the output is written to `<out-dir>/<stem>_masks.json`, re-indexed
-     0..N-1, and one JSON line is appended to --log per frame processed.
+     0..N-1 by default (or, with `--keep-ids`, kept/resegmented instances keep their original
+     `instance_idx` and "add" instances get fresh ids above the highest one this frame ever
+     used), and one JSON line is appended to --log per frame processed.
 
 Resumable: a frame whose `<out-dir>/<stem>_masks.json` already exists is skipped without opening
 the image or the model. Never writes to --masks-dir (the input files).
@@ -75,14 +78,14 @@ def load_instances(masks_json_path: Path) -> list[dict]:
     return out
 
 
-def build_output_instance(mask: np.ndarray, provenance: dict) -> dict:
+def build_output_instance(mask: np.ndarray, provenance: dict, rle_format: str = "compressed") -> dict:
     bbox = mask_bbox_xyxy(mask)
     centroid = mask_centroid(mask)
     return {
-        "instance_idx": None,  # reindexed by the caller
+        "instance_idx": None,  # assigned by the caller (re-indexed 0..N-1, or kept as-is with --keep-ids)
         "center_xy": centroid if centroid is not None else [0, 0],
         "area_px": int(mask.sum()),
-        "rle": rle_encode(mask),
+        "rle": rle_encode(mask, fmt=rle_format),
         "provenance": provenance,
     }
 
@@ -240,13 +243,34 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
         else:
             actions_log.append({"type": atype, "result": "unknown_action_type"})
 
-    out_instances = []
-    for idx in sorted(kept):
-        out_instances.append(build_output_instance(kept[idx]["mask"], kept[idx]["provenance"]))
-    for a in added:
-        out_instances.append(build_output_instance(a["mask"], a["provenance"]))
-    for i, inst in enumerate(out_instances):
-        inst["instance_idx"] = i
+    rle_format = getattr(args, "rle_format", "compressed")
+    keep_ids = getattr(args, "keep_ids", False)
+
+    kept_out = [
+        build_output_instance(kept[idx]["mask"], kept[idx]["provenance"], rle_format=rle_format)
+        for idx in sorted(kept)
+    ]
+    added_out = [
+        build_output_instance(a["mask"], a["provenance"], rle_format=rle_format) for a in added
+    ]
+
+    if keep_ids:
+        # Kept (untouched or resegmented) instances keep their original SAM3 track id --
+        # resegment.idx matching above is already keyed by instance_idx (inst_by_idx/kept), not
+        # list position, so this is just "don't renumber" rather than a matching change. "add"
+        # instances get fresh ids above the highest id this frame has ever used, so a track id
+        # never collides with one that was dropped by a resegment.wrong_object/duplicate action.
+        for idx, inst in zip(sorted(kept), kept_out):
+            inst["instance_idx"] = idx
+        next_id = max(inst_by_idx.keys(), default=-1) + 1
+        for inst in added_out:
+            inst["instance_idx"] = next_id
+            next_id += 1
+        out_instances = kept_out + added_out
+    else:
+        out_instances = kept_out + added_out
+        for i, inst in enumerate(out_instances):
+            inst["instance_idx"] = i
 
     log_entry = {
         "stem": stem,
@@ -264,17 +288,24 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
     return out_instances, log_entry
 
 
-def passthrough_masks(masks_json_path: Path) -> list[dict]:
+def passthrough_masks(masks_json_path: Path, keep_ids: bool = False, rle_format: str = "compressed") -> list[dict]:
     """Copy every instance in masks_json_path through unchanged (same mask/RLE), tagged with
-    provenance {"source": "original"}, re-indexed 0..N-1 -- same shape process_frame's "untouched"
-    instances get, for a frame with no worklist actions at all."""
+    provenance {"source": "original"}, re-indexed 0..N-1 (or keeping original instance_idx with
+    keep_ids=True) -- same shape process_frame's "untouched" instances get, for a frame with no
+    worklist actions at all."""
     instances = load_instances(masks_json_path)
     out = [
-        build_output_instance(inst["mask"], {"source": "original", "orig_idx": inst["instance_idx"]})
+        build_output_instance(
+            inst["mask"], {"source": "original", "orig_idx": inst["instance_idx"]}, rle_format=rle_format
+        )
         for inst in instances
     ]
-    for i, inst in enumerate(out):
-        inst["instance_idx"] = i
+    if keep_ids:
+        for inst, orig in zip(out, instances):
+            inst["instance_idx"] = orig["instance_idx"]
+    else:
+        for i, inst in enumerate(out):
+            inst["instance_idx"] = i
     return out
 
 
@@ -317,6 +348,15 @@ def main(argv=None):
     ap.add_argument("--text-prompt", default="person")
     ap.add_argument("--iou-match", type=float, default=0.5, help="min box IoU to match a text candidate to a proposed box/old mask")
     ap.add_argument("--dilate", type=float, default=0.10, help="fraction of box width/height to grow a resegment box prompt by, per side")
+    ap.add_argument("--keep-ids", action="store_true",
+                     help="output instances keep their original instance_idx (SAM3 track id) instead of "
+                          "being re-indexed 0..N-1: kept/resegmented instances keep their orig_idx, "
+                          "'add' instances get max(existing ids)+1, +2, .... Default (off) re-indexes "
+                          "0..N-1 for backwards compatibility.")
+    ap.add_argument("--rle-format", choices=["compressed", "intlist"], default="compressed",
+                     help="'compressed' (default): pycocotools-style LEB128 counts string, byte-compatible "
+                          "with the input files. 'intlist': uncompressed int-list counts, required by "
+                          "vision-llm-ann-generator/tracks.py's rle_decode (it rejects compressed strings).")
     ap.add_argument("--log", default="corrections.jsonl")
     ap.add_argument("--limit", type=int, default=None, help="process at most N worklist rows")
     ap.add_argument("--dry-run", action="store_true", help="run the model and compute corrections but do not write <out-dir> or --log")
@@ -402,7 +442,7 @@ def main(argv=None):
                 print(f"correct.py: passthrough: no masks_json for {stem}, skipping", file=sys.stderr)
                 n_pass_error += 1
                 continue
-            out_instances = passthrough_masks(masks_json_path)
+            out_instances = passthrough_masks(masks_json_path, keep_ids=args.keep_ids, rle_format=args.rle_format)
             if not args.dry_run:
                 with open(out_path, "w") as f:
                     json.dump(out_instances, f)

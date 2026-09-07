@@ -27,7 +27,7 @@ from geometry import (  # noqa: E402
     xyxy_norm_to_px,
     xyxy_to_xywh_norm,
 )  # mask_centroid also used directly below
-from rle import rle_decode, rle_encode  # noqa: E402
+from rle import rle_decode, rle_encode, rle_encode_intlist  # noqa: E402
 from segmenter import FakeSegmenter  # noqa: E402
 from correct import build_output_instance, load_instances, process_frame  # noqa: E402
 
@@ -135,6 +135,55 @@ def test_rle_encode_roundtrip_on_real_file():
         assert np.array_equal(mask, re_decoded)
 
 
+GENERATOR_REPO = Path("/home/b5bd/obrookes.b5bd/vision-llm-ann-generator")
+requires_generator_repo = pytest.mark.skipif(
+    not (GENERATOR_REPO / "tracks.py").is_file(), reason=f"{GENERATOR_REPO}/tracks.py not found"
+)
+
+
+def test_rle_encode_compressed_format_unchanged():
+    """fmt="compressed" (the default) must still behave exactly as rle_encode did before the
+    --rle-format flag was added: same compressed-string counts, same roundtrip."""
+    rng = np.random.default_rng(7)
+    mask = rng.random((17, 23)) > 0.5
+    default = rle_encode(mask)
+    explicit = rle_encode(mask, fmt="compressed")
+    assert default == explicit
+    assert isinstance(default["counts"], str)
+    assert np.array_equal(rle_decode(default), mask)
+
+
+@requires_generator_repo
+def test_rle_encode_intlist_roundtrips_with_own_and_generator_decoder():
+    sys.path.insert(0, str(GENERATOR_REPO))
+    import tracks as generator_tracks  # noqa: E402  (generator repo, not a package of this repo)
+
+    rng = np.random.default_rng(3)
+    for _ in range(5):
+        h, w = int(rng.integers(5, 40)), int(rng.integers(5, 40))
+        mask = rng.random((h, w)) > 0.5
+
+        rle = rle_encode_intlist(mask)
+        assert isinstance(rle["counts"], list)
+        assert all(isinstance(c, int) for c in rle["counts"])
+
+        assert np.array_equal(rle_decode(rle), mask)  # this repo's own decoder
+
+        theirs = generator_tracks.rle_decode(rle)
+        assert theirs.dtype == np.bool_ or theirs.dtype == bool
+        assert np.array_equal(theirs.astype(bool), mask)
+
+    # rle_encode(mask, fmt="intlist") must be the same call
+    mask = rng.random((11, 9)) > 0.5
+    assert rle_encode(mask, fmt="intlist") == rle_encode_intlist(mask)
+
+
+def test_rle_encode_unknown_fmt_raises():
+    mask = np.zeros((3, 3), dtype=bool)
+    with pytest.raises(ValueError):
+        rle_encode(mask, fmt="bogus")
+
+
 def test_rle_encode_agrees_with_pycocotools_when_available():
     pycocotools = pytest.importorskip("pycocotools")
     from pycocotools import mask as mask_api
@@ -184,6 +233,12 @@ class _Args:
     text_prompt = "person"
     iou_match = 0.5
     dilate = 0.10
+    keep_ids = False
+    rle_format = "compressed"
+
+
+class _KeepIdsArgs(_Args):
+    keep_ids = True
 
 
 @requires_real_data

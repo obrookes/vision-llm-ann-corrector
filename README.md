@@ -51,8 +51,8 @@ Input masks (`<masks-dir>/<stem>_masks.json`, never modified): a flat list of
 `{"instance_idx", "center_xy", "area_px", "rle": {"size": [h, w], "counts": <pycocotools-
 compressed string>}}`.
 
-Output masks (`<out-dir>/<stem>_masks.json`): same shape as the input, re-indexed `0..N-1`, plus a
-`"provenance"` field per instance:
+Output masks (`<out-dir>/<stem>_masks.json`): same shape as the input, re-indexed `0..N-1` by
+default, plus a `"provenance"` field per instance:
 
     {"source": "original" | "auto" | "removed", "action": "resegment" | "add", "orig_idx": int,
      "issue": str, "prompt": "text" | "box", "score": float}
@@ -61,6 +61,22 @@ Output masks (`<out-dir>/<stem>_masks.json`): same shape as the input, re-indexe
 what the input files already use. Corrections are logged one JSON line per frame processed to
 `--log` (default `corrections.jsonl`): stem, in/out mask counts, per-action outcomes, candidate/
 fallback counts, timing.
+
+### `--keep-ids` and `--rle-format`
+
+`--keep-ids`: don't re-index the output 0..N-1. Kept/resegmented instances keep their original
+`instance_idx` unchanged; `"add"` instances get fresh ids `max(existing ids)+1, +2, ...`. Use
+this when `instance_idx` values are SAM3 track ids from `vision-llm-ann-generator` (non-contiguous,
+must be preserved across the correction loop) rather than positional `0..N-1` indices.
+`resegment.idx` matching is keyed by `instance_idx` (not list position) in both modes -- see
+`process_frame`'s `inst_by_idx`/`kept` dicts, both keyed by `instance_idx`.
+
+`--rle-format {compressed,intlist}` (default `compressed`): `compressed` writes the same
+pycocotools-style LEB128 `counts` string the input files already use (unchanged default
+behaviour). `intlist` writes uncompressed int-list `counts`
+(`{"size": [h, w], "counts": [int, ...]}`, same column-major convention, `counts[0]` = background
+run) instead -- required when the output will be read by `vision-llm-ann-generator/tracks.py`'s
+`rle_decode`, which explicitly rejects compressed string counts.
 
 ## Running it
 
