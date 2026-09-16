@@ -4,7 +4,7 @@ rle.py and the test suite run on a CPU-only login node without sam3 or torch ins
 
 Exposes:
     Sam3Segmenter(checkpoint, device="cuda", score_thresh=0.5)
-        .text(pil, prompt) -> list[Candidate]
+        .text(pil, prompt, score_thresh=None) -> list[Candidate]  # score_thresh overrides self.score_thresh for this call
         .box(pil, xywh_norm, point=None) -> Candidate | None
         .close()
     FakeSegmenter(...)          # same interface, returns synthetic rectangles; no sam3/torch import
@@ -178,15 +178,20 @@ class Sam3Segmenter:
         out.sort(key=lambda c: c.score, reverse=True)
         return out
 
-    def text(self, pil, prompt: str) -> list:
+    def text(self, pil, prompt: str, score_thresh: float | None = None) -> list:
+        """`score_thresh` overrides `self.score_thresh` (`output_prob_thresh`) for this call only
+        -- used by correct.py's `hard_case` action to run a second, lower-threshold text pass
+        without disturbing the frame's cached default-threshold pass (see get_text_candidates()
+        vs get_text_candidates_at() in correct.py's process_frame)."""
         predictor, session_id = self._ensure_session(pil)
+        thresh = self.score_thresh if score_thresh is None else score_thresh
         resp = predictor.handle_request(
             dict(
                 type="add_prompt",
                 session_id=session_id,
                 frame_index=0,
                 text=prompt,
-                output_prob_thresh=self.score_thresh,
+                output_prob_thresh=thresh,
             )
         )
         return self._to_candidates(resp)
@@ -237,8 +242,8 @@ class FakeSegmenter:
     def __init__(self, *args, **kwargs):
         self.calls = []
 
-    def text(self, pil, prompt: str) -> list:
-        self.calls.append(("text", prompt))
+    def text(self, pil, prompt: str, score_thresh: float | None = None) -> list:
+        self.calls.append(("text", prompt, score_thresh))
         w, h = pil.size
         mask = np.ones((h, w), dtype=bool)
         cand = _candidate_from_mask(mask, 0.9)

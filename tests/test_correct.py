@@ -367,6 +367,198 @@ def test_process_frame_reindexes_output_0_to_n_minus_1(tmp_path):
 
 # ── build_output_instance ───────────────────────────────────────────────────
 
+# ── hard_case action ─────────────────────────────────────────────────────
+
+class _ZonedFakeSegmenter:
+    """FakeSegmenter-like stand-in whose .text() returns several fixed candidates at known
+    positions instead of a single whole-frame rectangle, so box/zone/score selection logic can be
+    exercised precisely. Records every call like FakeSegmenter."""
+
+    def __init__(self, candidates_by_thresh):
+        self.calls = []
+        self._candidates_by_thresh = candidates_by_thresh  # {score_thresh_or_None: [Candidate,...]}
+
+    def text(self, pil, prompt, score_thresh=None):
+        self.calls.append(("text", prompt, score_thresh))
+        return list(self._candidates_by_thresh.get(score_thresh, []))
+
+    def box(self, pil, xywh_norm, point=None):
+        self.calls.append(("box", tuple(xywh_norm), point))
+        w, h = pil.size
+        x0n, y0n, wn, hn = xywh_norm
+        x0, y0 = int(round(x0n * w)), int(round(y0n * h))
+        x1, y1 = int(round((x0n + wn) * w)), int(round((y0n + hn) * h))
+        mask = np.zeros((h, w), dtype=bool)
+        mask[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = True
+        from segmenter import _candidate_from_mask
+        return _candidate_from_mask(mask, 0.7)
+
+    def close(self):
+        pass
+
+
+def _empty_frame(tmp_path, h=90, w=90):
+    masks_json = _make_masks_json(tmp_path, [])
+    image_path = tmp_path / "frame.png"
+    from PIL import Image
+    Image.fromarray(np.zeros((h, w, 3), dtype=np.uint8)).save(image_path)
+    return image_path, masks_json
+
+
+def test_hard_case_box_candidate_inside_box_accepted(tmp_path):
+    h, w = 90, 90
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    from segmenter import _candidate_from_mask
+    inside = _square_mask(h, w, [10, 10, 20, 20])  # fully inside the box below
+    outside = _square_mask(h, w, [70, 70, 89, 89])  # not overlapping the box at all
+    fake = _ZonedFakeSegmenter({0.1: [_candidate_from_mask(outside, 0.5), _candidate_from_mask(inside, 0.9)]})
+
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [{"type": "hard_case", "box": [0.0, 0.0, 0.4, 0.4], "zone": None,
+                     "difficulty": "hard", "score_thresh": 0.1, "source": "motion", "votes": 1}],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    added = [o for o in out_instances if o["provenance"].get("action") == "hard_case"]
+    assert len(added) == 1
+    assert added[0]["provenance"]["prompt"] == "text_lowthresh"
+    assert added[0]["provenance"]["score"] == pytest.approx(0.9)
+    assert added[0]["provenance"]["hard_case_source"] == "motion"
+    assert added[0]["provenance"]["score_thresh"] == 0.1
+    assert sum(1 for c in fake.calls if c[0] == "box") == 0
+    assert log_entry["actions"][0]["result"] == "added"
+
+
+def test_hard_case_box_candidate_outside_box_falls_back_to_box_prompt(tmp_path):
+    h, w = 90, 90
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    from segmenter import _candidate_from_mask
+    outside = _square_mask(h, w, [70, 70, 89, 89])
+    fake = _ZonedFakeSegmenter({0.1: [_candidate_from_mask(outside, 0.9)]})
+
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [{"type": "hard_case", "box": [0.0, 0.0, 0.2, 0.2], "zone": None,
+                     "difficulty": "hard", "score_thresh": 0.1, "source": "none", "votes": 1}],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    added = [o for o in out_instances if o["provenance"].get("action") == "hard_case"]
+    assert len(added) == 1
+    assert added[0]["provenance"]["prompt"] == "box"
+    assert sum(1 for c in fake.calls if c[0] == "box") == 1
+    assert log_entry["n_fallback_box_prompts"] == 1
+
+
+def test_hard_case_null_box_zone_filter(tmp_path):
+    h, w = 90, 90
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    from segmenter import _candidate_from_mask
+    upper = _square_mask(h, w, [10, 0, 20, 10])     # centre y ~5, upper third (< 30)
+    lower = _square_mask(h, w, [10, 70, 20, 85])    # centre y ~77, lower third (>= 60)
+    fake = _ZonedFakeSegmenter({0.1: [_candidate_from_mask(upper, 0.95), _candidate_from_mask(lower, 0.5)]})
+
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [{"type": "hard_case", "box": None, "zone": "lower",
+                     "difficulty": "moderate", "score_thresh": 0.1, "source": "motion", "votes": 1}],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    added = [o for o in out_instances if o["provenance"].get("action") == "hard_case"]
+    assert len(added) == 1
+    # zone=lower must pick the lower-zone candidate (score 0.5) even though the upper-zone one
+    # scores higher -- proves the zone filter is applied before the max-score pick.
+    assert added[0]["provenance"]["score"] == pytest.approx(0.5)
+
+
+def test_hard_case_no_candidate_no_change_and_logged(tmp_path):
+    h, w = 90, 90
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    fake = _ZonedFakeSegmenter({0.1: []})  # no candidates at all
+
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [{"type": "hard_case", "box": None, "zone": None,
+                     "difficulty": "hard", "score_thresh": 0.1, "source": "none", "votes": 1}],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    assert out_instances == []
+    assert log_entry["n_added"] == 0
+    assert log_entry["actions"][0]["result"] == "hard_case_no_candidate"
+
+
+def test_hard_case_per_action_threshold_passed_to_segmenter_default_pass_unaffected(tmp_path):
+    """The hard_case pass must call segmenter.text(..., score_thresh=0.1); an "add" action on the
+    same frame must still use the cached default-threshold pass (score_thresh=None), proving the
+    two are cached/called separately."""
+    h, w = 90, 90
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    from segmenter import _candidate_from_mask
+    default_cand = _square_mask(h, w, [0, 0, 90, 90])  # whole frame, matches the add box below
+    low_cand = _square_mask(h, w, [10, 10, 20, 20])
+    fake = _ZonedFakeSegmenter({
+        None: [_candidate_from_mask(default_cand, 0.9)],
+        0.1: [_candidate_from_mask(low_cand, 0.9)],
+    })
+
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [
+            {"type": "add", "box": [0.0, 0.0, 1.0, 1.0], "note": "whole frame"},
+            {"type": "hard_case", "box": [0.0, 0.0, 0.4, 0.4], "zone": None,
+             "difficulty": "hard", "score_thresh": 0.1, "source": "motion", "votes": 1},
+        ],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    text_calls = [c for c in fake.calls if c[0] == "text"]
+    assert ("text", "person", None) in text_calls
+    assert ("text", "person", 0.1) in text_calls
+    added = {o["provenance"]["action"]: o for o in out_instances}
+    assert added["add"]["provenance"]["prompt"] == "text"
+    assert added["hard_case"]["provenance"]["prompt"] == "text_lowthresh"
+
+
+def test_hard_case_max_new_caps_additional_instances(tmp_path):
+    h, w = 90, 90
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    from segmenter import _candidate_from_mask
+    cand = _square_mask(h, w, [10, 10, 20, 20])
+    fake = _ZonedFakeSegmenter({0.1: [_candidate_from_mask(cand, 0.9)]})
+
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [
+            {"type": "hard_case", "box": [0.0, 0.0, 0.4, 0.4], "zone": None, "score_thresh": 0.1,
+             "source": "motion", "votes": 1},
+            {"type": "hard_case", "box": [0.0, 0.0, 0.4, 0.4], "zone": None, "score_thresh": 0.1,
+             "source": "motion", "votes": 1},
+        ],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    added = [o for o in out_instances if o["provenance"].get("action") == "hard_case"]
+    assert len(added) == 1  # max_new defaults to 1, second hard_case action is a no-op
+    assert log_entry["actions"][1]["result"] == "max_new_reached"
+
+
+def test_unknown_action_type_does_not_break_processing(tmp_path):
+    h, w = 40, 40
+    image_path, masks_json = _empty_frame(tmp_path, h, w)
+    fake = FakeSegmenter()
+    rec = {
+        "image": str(image_path), "masks_json": str(masks_json),
+        "actions": [{"type": "some_future_action", "foo": "bar"}],
+        "confidence": "low",
+    }
+    out_instances, log_entry = process_frame(rec, fake, _Args(), image_path, masks_json)
+    assert out_instances == []
+    assert log_entry["actions"][0]["result"] == "unknown_action_type"
+
+
 def test_build_output_instance_area_and_rle_consistent():
     mask = _square_mask(20, 20, [2, 3, 10, 8])
     inst = build_output_instance(mask, {"source": "original"})

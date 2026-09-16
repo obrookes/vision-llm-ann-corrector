@@ -21,7 +21,14 @@ the format: `image`, `masks_json`, `actions` = [{"type": "resegment", "idx", "is
   4. "resegment" actions: {wrong_object, duplicate} -> drop the instance, no re-prompt.
      {loose, fragment, merged, ...} -> prefer a text candidate with IoU > 0.5 vs the old mask,
      else a box prompt on the old mask's bbox dilated by --dilate, replacing the instance.
-  5. Untouched instances are copied unchanged (identical RLE). Every output instance carries a
+  5. "hard_case" actions (verifier-emitted for frames with no mask despite K>=1 animals on the
+     annotation sheet): re-run the text prompt at the action's own lowered "score_thresh" (kept
+     separate from the frame's cached default-threshold text pass). If "box" is given, keep
+     candidates with >=50% of their mask inside the box and take the highest-scoring one, else
+     fall back to a box prompt (dilated by --dilate, centre-point tie-break). If "box" is null,
+     filter by "zone" (frame thirds) when given, else take the single highest-scoring candidate.
+     At most one new instance per action ("max_new", default 1). See README.md's action table.
+  6. Untouched instances are copied unchanged (identical RLE). Every output instance carries a
      `"provenance"` field; the output is written to `<out-dir>/<stem>_masks.json`, re-indexed
      0..N-1 by default (or, with `--keep-ids`, kept/resegmented instances keep their original
      `instance_idx` and "add" instances get fresh ids above the highest one this frame ever
@@ -122,6 +129,7 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
     added: list[dict] = []  # [{"mask", "provenance"}]
 
     text_candidates_cache = None
+    text_lowthresh_cache: dict[float, list] = {}
 
     def get_text_candidates():
         nonlocal text_candidates_cache, n_text_candidates
@@ -130,8 +138,25 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
             n_text_candidates = len(text_candidates_cache)
         return text_candidates_cache
 
+    def get_text_candidates_at(score_thresh):
+        """Separate, per-threshold cache from get_text_candidates()'s default-threshold pass --
+        used by the `hard_case` action's lowered-confidence pass so it doesn't disturb the
+        frame's cached default text pass (still used unmodified by add/resegment actions)."""
+        if score_thresh not in text_lowthresh_cache:
+            text_lowthresh_cache[score_thresh] = segmenter.text(pil, args.text_prompt, score_thresh=score_thresh)
+        return text_lowthresh_cache[score_thresh]
+
     def overlaps_kept(mask: np.ndarray) -> bool:
         return any(iou_masks(mask, k["mask"]) > 0.5 for k in kept.values())
+
+    def _zone_of_center(c, height: int) -> str:
+        x0, y0, w, h = c.box_xywh
+        cy = y0 + h / 2.0
+        if cy < height / 3.0:
+            return "upper"
+        if cy < 2.0 * height / 3.0:
+            return "middle"
+        return "lower"
 
     for action in rec.get("actions", []):
         atype = action.get("type")
@@ -239,6 +264,72 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
                 },
             })
             actions_log.append({"type": "add", "box": box_norm, "result": "added", "prompt": prompt_kind})
+
+        elif atype == "hard_case":
+            box_norm = action.get("box")
+            zone = action.get("zone")
+            score_thresh = action.get("score_thresh")
+            source = action.get("source")
+            max_new = action.get("max_new", 1)
+
+            n_already_added = sum(1 for a in added if a["provenance"].get("action") == "hard_case")
+            if n_already_added >= max_new:
+                actions_log.append({"type": "hard_case", "result": "max_new_reached"})
+                continue
+
+            candidates = get_text_candidates_at(score_thresh) if score_thresh is not None else get_text_candidates()
+
+            cand = None
+            prompt_kind = None
+
+            if box_norm is not None:
+                box_px = xyxy_norm_to_px(box_norm, width, height)
+                best_score = -1.0
+                for c in candidates:
+                    if mask_in_box_fraction(c.mask, box_px) < 0.5:
+                        continue
+                    if c.score > best_score:
+                        best_score = c.score
+                        cand = c
+                if cand is not None:
+                    prompt_kind = "text_lowthresh"
+                else:
+                    dilated = dilate_xyxy(box_px, args.dilate, width, height)
+                    xywh_norm = xyxy_to_xywh_norm(dilated, width, height)
+                    point = [(box_px[0] + box_px[2]) / 2, (box_px[1] + box_px[3]) / 2]
+                    cand = segmenter.box(pil, xywh_norm, point=point)
+                    prompt_kind = "box"
+                    n_fallback += 1
+            else:
+                pool = candidates
+                if zone is not None:
+                    pool = [c for c in candidates if _zone_of_center(c, height) == zone]
+                if pool:
+                    cand = max(pool, key=lambda c: c.score)
+                    prompt_kind = "text_lowthresh"
+
+            if cand is None:
+                actions_log.append({
+                    "type": "hard_case", "box": box_norm, "zone": zone, "source": source,
+                    "result": "hard_case_no_candidate",
+                })
+                continue
+
+            added.append({
+                "mask": cand.mask,
+                "provenance": {
+                    "source": "auto",
+                    "action": "hard_case",
+                    "prompt": prompt_kind,
+                    "score": cand.score,
+                    "score_thresh": score_thresh,
+                    "hard_case_source": source,
+                },
+            })
+            actions_log.append({
+                "type": "hard_case", "box": box_norm, "zone": zone, "source": source,
+                "result": "added", "prompt": prompt_kind,
+            })
 
         else:
             actions_log.append({"type": atype, "result": "unknown_action_type"})
