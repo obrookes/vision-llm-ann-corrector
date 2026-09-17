@@ -106,12 +106,36 @@ def _rle_encode_numpy(mask: np.ndarray) -> dict:
     return {"size": [h, w], "counts": _counts_to_string(counts)}
 
 
-def rle_encode(mask: np.ndarray) -> dict:
-    """Encode a bool (H, W) mask to a COCO RLE dict with a compressed-string `counts`.
+def rle_encode_intlist(mask: np.ndarray) -> dict:
+    """Encode a bool (H, W) mask to a COCO RLE dict with UNCOMPRESSED int-list `counts`
+    ({"size": [h, w], "counts": [int, ...]}), column-major, counts[0] = background run.
 
-    Uses pycocotools when available (guaranteed byte-identical to the input files' producer);
-    falls back to the pure-numpy re-implementation above otherwise.
+    This is the format vision-llm-ann-generator/tracks.py:rle_decode requires -- its decoder
+    explicitly rejects compressed string counts (the default `rle_encode` here produces exactly
+    that, which the generator's decoder can't read). No pycocotools needed either way, since
+    `_counts_from_mask` already produces this convention directly (it's `rle_encode`'s compressed
+    path's own intermediate representation, before `_counts_to_string` LEB128-encodes it).
     """
+    mask = np.ascontiguousarray(mask.astype(bool))
+    h, w = mask.shape
+    counts = _counts_from_mask(mask)
+    return {"size": [h, w], "counts": [int(c) for c in counts]}
+
+
+def rle_encode(mask: np.ndarray, fmt: str = "compressed") -> dict:
+    """Encode a bool (H, W) mask to a COCO RLE dict.
+
+    fmt="compressed" (default): LEB128-ish compressed-string `counts`, byte-compatible with the
+    input files' schema. Uses pycocotools when available (guaranteed byte-identical to the input
+    files' producer); falls back to the pure-numpy re-implementation above otherwise.
+
+    fmt="intlist": uncompressed int-list `counts` -- see `rle_encode_intlist`.
+    """
+    if fmt == "intlist":
+        return rle_encode_intlist(mask)
+    if fmt != "compressed":
+        raise ValueError(f"rle_encode: unknown fmt {fmt!r}, expected 'compressed' or 'intlist'")
+
     mask = np.ascontiguousarray(mask.astype(bool))
     try:
         from pycocotools import mask as _mask_api

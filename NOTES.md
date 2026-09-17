@@ -72,6 +72,32 @@ session transcript for the exact command) -- `tests/test_correct.py`'s
 pycocotools is importable, and skips otherwise (true on the login-node python used to actually run
 `pytest` for this repo).
 
+## `--keep-ids` / `--rle-format intlist` (2026-09-07)
+
+The next worklist this repo processes (`$SCRATCH/chimp/...`) has `instance_idx` values that are
+SAM3 track ids assigned by `vision-llm-ann-generator` during tracking, not positional `0..N-1`
+indices -- they're sparse/non-contiguous and must survive the correction loop unchanged so
+downstream consumers (re-verify, the generator's own track bookkeeping) can still key on them.
+`--keep-ids` turns off `correct.py`'s default re-indexing: kept/resegmented instances keep their
+`instance_idx`; `"add"` instances get ids above the highest one the frame ever used
+(`max(inst_by_idx.keys())+1, +2, ...`, computed from the *original* instance set so a dropped
+`wrong_object`/`duplicate` instance's id is never reused within the same frame). Both
+`process_frame`'s `resegment.idx` matching and `passthrough_masks` already worked (and still work)
+by `instance_idx`, not list position -- `inst_by_idx`/`kept` were already dicts keyed by
+`instance_idx` before this change, so nothing there needed fixing, only the final
+reindex-vs-keep step.
+
+`--rle-format intlist` exists because `vision-llm-ann-generator/tracks.py:rle_decode`
+(`/home/b5bd/obrookes.b5bd/vision-llm-ann-generator/tracks.py`) hard-rejects compressed string
+`counts` (`raise ValueError(...)` if `isinstance(counts, str)`) -- it only reads the uncompressed
+int-list COCO RLE form. `rle.py`'s `_counts_from_mask` already produces exactly that list (it's
+the pre-LEB128 intermediate value the default `compressed` path encodes further), so
+`rle_encode_intlist`/`rle_encode(mask, fmt="intlist")` just returns it directly -- no pycocotools
+involved either way. Verified round-trip both ways in `tests/test_correct.py`: our own
+`rle_decode` and the generator's `tracks.rle_decode` (imported via `sys.path.insert` at the
+generator repo's absolute path) both reproduce the original random mask from an intlist-encoded
+RLE.
+
 ## Things not done / left for whoever runs this on a GPU node
 
 - No end-to-end run against real SAM3 has happened -- everything above is either read from the

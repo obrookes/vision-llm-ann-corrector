@@ -28,8 +28,29 @@ text pass doesn't already contain a good match:
    - `loose` / `fragment` / `merged` / anything else: prefer a text candidate with IoU > 0.5
      against the old mask; otherwise prompt with the old mask's bounding box, dilated by
      `--dilate` on each side, and replace the instance.
-5. Untouched instances are copied through byte-identical (same RLE). Every output instance carries
+5. `"hard_case"` actions (a frame where the segmenter produced no mask although the annotation
+   sheet records K >= 1 animals, emitted by the verifier's worklist for text-prompt misses):
+   re-run the text prompt at a per-action lowered `score_thresh`, separately from the frame's
+   cached default-threshold text pass (so other actions on the same frame are unaffected). If
+   `box` is given, keep candidates with >= 50% of their mask inside `box` and pick the
+   highest-scoring one, falling back to a box prompt (dilated by `--dilate`, centre-point
+   tie-break) if none qualify. If `box` is null, restrict candidates to `zone` (the horizontal
+   third of the frame their bbox centre falls in) when given, else take the single
+   highest-scoring candidate. At most one new instance per action (`max_new`, default 1). See the
+   action table below.
+6. Untouched instances are copied through byte-identical (same RLE). Every output instance carries
    a `"provenance"` field recording where it came from.
+
+### Worklist action types
+
+| `type`       | fields                                                                 | effect |
+|--------------|-------------------------------------------------------------------------|--------|
+| `add`        | `box` (normalised `[x0,y0,x1,y1]`), `note`                              | new instance: text candidate matched to `box` by IoU, else box-prompt fallback |
+| `resegment`  | `idx`, `issue`                                                          | `wrong_object`/`duplicate`: drop instance. Else: replace with text candidate (IoU > 0.5 vs old mask) or box-prompt fallback on the old mask's dilated bbox |
+| `hard_case`  | `box` (normalised, or `null`), `zone` (`"lower"`/`"middle"`/`"upper"`/`null`), `difficulty`, `score_thresh`, `source` (`"motion"`/`"none"`), `votes`, `max_new` (default 1) | new instance from a lowered-threshold text pass, filtered by `box` (>= 50% mask-in-box, else box-prompt fallback) or `zone`/highest-score when `box` is `null`; no change + `hard_case_no_candidate` log if nothing qualifies |
+
+Unknown/future action types are logged as `unknown_action_type` and otherwise ignored, so older
+worklists and older correctors stay compatible with each other.
 
 See `segmenter.py`'s module docstring for a documented deviation from the original box+point
 combined-prompt idea: the installed SAM3 API (`sam3` 0.1.0) doesn't support combining a box and a
@@ -44,23 +65,43 @@ Input worklist: one JSON line per frame, produced by `vision-llm-ann-verifier`'s
 
     {"image": "<path>.png", "masks_json": "<path>_masks.json", "n_masks": int,
      "actions": [{"type": "resegment", "idx": int, "issue": str} |
-                 {"type": "add", "box": [x0,y0,x1,y1] (0-1 normalised), "note": str}],
+                 {"type": "add", "box": [x0,y0,x1,y1] (0-1 normalised), "note": str} |
+                 {"type": "hard_case", "box": [x0,y0,x1,y1] | null, "zone": "lower"|"middle"|"upper"|null,
+                  "difficulty": str, "score_thresh": float, "source": "motion"|"none", "votes": int,
+                  "max_new": int}],
      "votes": {...}, "confidence": "high" | "low"}
 
 Input masks (`<masks-dir>/<stem>_masks.json`, never modified): a flat list of
 `{"instance_idx", "center_xy", "area_px", "rle": {"size": [h, w], "counts": <pycocotools-
 compressed string>}}`.
 
-Output masks (`<out-dir>/<stem>_masks.json`): same shape as the input, re-indexed `0..N-1`, plus a
-`"provenance"` field per instance:
+Output masks (`<out-dir>/<stem>_masks.json`): same shape as the input, re-indexed `0..N-1` by
+default, plus a `"provenance"` field per instance:
 
-    {"source": "original" | "auto" | "removed", "action": "resegment" | "add", "orig_idx": int,
-     "issue": str, "prompt": "text" | "box", "score": float}
+    {"source": "original" | "auto" | "removed", "action": "resegment" | "add" | "hard_case", "orig_idx": int,
+     "issue": str, "prompt": "text" | "box" | "text_lowthresh", "score": float,
+     "score_thresh": float, "hard_case_source": "motion" | "none"}
 
 `center_xy` in the output is the mask's centroid (mean of its True pixel coordinates), matching
 what the input files already use. Corrections are logged one JSON line per frame processed to
 `--log` (default `corrections.jsonl`): stem, in/out mask counts, per-action outcomes, candidate/
 fallback counts, timing.
+
+### `--keep-ids` and `--rle-format`
+
+`--keep-ids`: don't re-index the output 0..N-1. Kept/resegmented instances keep their original
+`instance_idx` unchanged; `"add"` instances get fresh ids `max(existing ids)+1, +2, ...`. Use
+this when `instance_idx` values are SAM3 track ids from `vision-llm-ann-generator` (non-contiguous,
+must be preserved across the correction loop) rather than positional `0..N-1` indices.
+`resegment.idx` matching is keyed by `instance_idx` (not list position) in both modes -- see
+`process_frame`'s `inst_by_idx`/`kept` dicts, both keyed by `instance_idx`.
+
+`--rle-format {compressed,intlist}` (default `compressed`): `compressed` writes the same
+pycocotools-style LEB128 `counts` string the input files already use (unchanged default
+behaviour). `intlist` writes uncompressed int-list `counts`
+(`{"size": [h, w], "counts": [int, ...]}`, same column-major convention, `counts[0]` = background
+run) instead -- required when the output will be read by `vision-llm-ann-generator/tracks.py`'s
+`rle_decode`, which explicitly rejects compressed string counts.
 
 ## Running it
 

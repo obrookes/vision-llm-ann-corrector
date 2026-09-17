@@ -4,6 +4,7 @@
         --frames-dir $SCRATCH/frames --masks-dir $SCRATCH/masks --out-dir $SCRATCH/masks_v2 \\
         --checkpoint $SCRATCH/weights/sam3/sam3-safari-pos.pt \\
         [--min-confidence high|low] [--text-prompt person] [--iou-match 0.5] [--dilate 0.10] \\
+        [--keep-ids] [--rle-format compressed|intlist] \\
         [--log corrections.jsonl] [--limit N] [--dry-run] [--fake] [--device cuda] \\
         [--passthrough-manifest manifest.txt]
 
@@ -20,9 +21,18 @@ the format: `image`, `masks_json`, `actions` = [{"type": "resegment", "idx", "is
   4. "resegment" actions: {wrong_object, duplicate} -> drop the instance, no re-prompt.
      {loose, fragment, merged, ...} -> prefer a text candidate with IoU > 0.5 vs the old mask,
      else a box prompt on the old mask's bbox dilated by --dilate, replacing the instance.
-  5. Untouched instances are copied unchanged (identical RLE). Every output instance carries a
+  5. "hard_case" actions (verifier-emitted for frames with no mask despite K>=1 animals on the
+     annotation sheet): re-run the text prompt at the action's own lowered "score_thresh" (kept
+     separate from the frame's cached default-threshold text pass). If "box" is given, keep
+     candidates with >=50% of their mask inside the box and take the highest-scoring one, else
+     fall back to a box prompt (dilated by --dilate, centre-point tie-break). If "box" is null,
+     filter by "zone" (frame thirds) when given, else take the single highest-scoring candidate.
+     At most one new instance per action ("max_new", default 1). See README.md's action table.
+  6. Untouched instances are copied unchanged (identical RLE). Every output instance carries a
      `"provenance"` field; the output is written to `<out-dir>/<stem>_masks.json`, re-indexed
-     0..N-1, and one JSON line is appended to --log per frame processed.
+     0..N-1 by default (or, with `--keep-ids`, kept/resegmented instances keep their original
+     `instance_idx` and "add" instances get fresh ids above the highest one this frame ever
+     used), and one JSON line is appended to --log per frame processed.
 
 Resumable: a frame whose `<out-dir>/<stem>_masks.json` already exists is skipped without opening
 the image or the model. Never writes to --masks-dir (the input files).
@@ -75,14 +85,14 @@ def load_instances(masks_json_path: Path) -> list[dict]:
     return out
 
 
-def build_output_instance(mask: np.ndarray, provenance: dict) -> dict:
+def build_output_instance(mask: np.ndarray, provenance: dict, rle_format: str = "compressed") -> dict:
     bbox = mask_bbox_xyxy(mask)
     centroid = mask_centroid(mask)
     return {
-        "instance_idx": None,  # reindexed by the caller
+        "instance_idx": None,  # assigned by the caller (re-indexed 0..N-1, or kept as-is with --keep-ids)
         "center_xy": centroid if centroid is not None else [0, 0],
         "area_px": int(mask.sum()),
-        "rle": rle_encode(mask),
+        "rle": rle_encode(mask, fmt=rle_format),
         "provenance": provenance,
     }
 
@@ -119,6 +129,7 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
     added: list[dict] = []  # [{"mask", "provenance"}]
 
     text_candidates_cache = None
+    text_lowthresh_cache: dict[float, list] = {}
 
     def get_text_candidates():
         nonlocal text_candidates_cache, n_text_candidates
@@ -127,8 +138,25 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
             n_text_candidates = len(text_candidates_cache)
         return text_candidates_cache
 
+    def get_text_candidates_at(score_thresh):
+        """Separate, per-threshold cache from get_text_candidates()'s default-threshold pass --
+        used by the `hard_case` action's lowered-confidence pass so it doesn't disturb the
+        frame's cached default text pass (still used unmodified by add/resegment actions)."""
+        if score_thresh not in text_lowthresh_cache:
+            text_lowthresh_cache[score_thresh] = segmenter.text(pil, args.text_prompt, score_thresh=score_thresh)
+        return text_lowthresh_cache[score_thresh]
+
     def overlaps_kept(mask: np.ndarray) -> bool:
         return any(iou_masks(mask, k["mask"]) > 0.5 for k in kept.values())
+
+    def _zone_of_center(c, height: int) -> str:
+        x0, y0, w, h = c.box_xywh
+        cy = y0 + h / 2.0
+        if cy < height / 3.0:
+            return "upper"
+        if cy < 2.0 * height / 3.0:
+            return "middle"
+        return "lower"
 
     for action in rec.get("actions", []):
         atype = action.get("type")
@@ -237,16 +265,103 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
             })
             actions_log.append({"type": "add", "box": box_norm, "result": "added", "prompt": prompt_kind})
 
+        elif atype == "hard_case":
+            box_norm = action.get("box")
+            zone = action.get("zone")
+            score_thresh = action.get("score_thresh")
+            source = action.get("source")
+            max_new = action.get("max_new", 1)
+
+            n_already_added = sum(1 for a in added if a["provenance"].get("action") == "hard_case")
+            if n_already_added >= max_new:
+                actions_log.append({"type": "hard_case", "result": "max_new_reached"})
+                continue
+
+            candidates = get_text_candidates_at(score_thresh) if score_thresh is not None else get_text_candidates()
+
+            cand = None
+            prompt_kind = None
+
+            if box_norm is not None:
+                box_px = xyxy_norm_to_px(box_norm, width, height)
+                best_score = -1.0
+                for c in candidates:
+                    if mask_in_box_fraction(c.mask, box_px) < 0.5:
+                        continue
+                    if c.score > best_score:
+                        best_score = c.score
+                        cand = c
+                if cand is not None:
+                    prompt_kind = "text_lowthresh"
+                else:
+                    dilated = dilate_xyxy(box_px, args.dilate, width, height)
+                    xywh_norm = xyxy_to_xywh_norm(dilated, width, height)
+                    point = [(box_px[0] + box_px[2]) / 2, (box_px[1] + box_px[3]) / 2]
+                    cand = segmenter.box(pil, xywh_norm, point=point)
+                    prompt_kind = "box"
+                    n_fallback += 1
+            else:
+                pool = candidates
+                if zone is not None:
+                    pool = [c for c in candidates if _zone_of_center(c, height) == zone]
+                if pool:
+                    cand = max(pool, key=lambda c: c.score)
+                    prompt_kind = "text_lowthresh"
+
+            if cand is None:
+                actions_log.append({
+                    "type": "hard_case", "box": box_norm, "zone": zone, "source": source,
+                    "result": "hard_case_no_candidate",
+                })
+                continue
+
+            added.append({
+                "mask": cand.mask,
+                "provenance": {
+                    "source": "auto",
+                    "action": "hard_case",
+                    "prompt": prompt_kind,
+                    "score": cand.score,
+                    "score_thresh": score_thresh,
+                    "hard_case_source": source,
+                },
+            })
+            actions_log.append({
+                "type": "hard_case", "box": box_norm, "zone": zone, "source": source,
+                "result": "added", "prompt": prompt_kind,
+            })
+
         else:
             actions_log.append({"type": atype, "result": "unknown_action_type"})
 
-    out_instances = []
-    for idx in sorted(kept):
-        out_instances.append(build_output_instance(kept[idx]["mask"], kept[idx]["provenance"]))
-    for a in added:
-        out_instances.append(build_output_instance(a["mask"], a["provenance"]))
-    for i, inst in enumerate(out_instances):
-        inst["instance_idx"] = i
+    rle_format = getattr(args, "rle_format", "compressed")
+    keep_ids = getattr(args, "keep_ids", False)
+
+    kept_out = [
+        build_output_instance(kept[idx]["mask"], kept[idx]["provenance"], rle_format=rle_format)
+        for idx in sorted(kept)
+    ]
+    added_out = [
+        build_output_instance(a["mask"], a["provenance"], rle_format=rle_format) for a in added
+    ]
+
+    if keep_ids:
+        # Kept (untouched or resegmented) instances keep their original SAM3 track id --
+        # resegment.idx matching above is already keyed by instance_idx (inst_by_idx/kept), not
+        # list position, so this is just "don't renumber" rather than a matching change. "add"
+        # instances get fresh ids above the highest id this frame has ever used, so a track id
+        # never collides with one that was dropped by a resegment.wrong_object/duplicate action.
+        for idx, inst in zip(sorted(kept), kept_out):
+            inst["instance_idx"] = idx
+        next_id = max(inst_by_idx.keys(), default=-1) + 1
+        for inst in added_out:
+            inst["instance_idx"] = next_id
+            next_id += 1
+        out_instances = kept_out + added_out
+    else:
+        out_instances = kept_out + added_out
+        for i, inst in enumerate(out_instances):
+            inst["instance_idx"] = i
 
     log_entry = {
         "stem": stem,
@@ -264,17 +379,24 @@ def process_frame(rec: dict, segmenter, args, image_path: Path, masks_json_path:
     return out_instances, log_entry
 
 
-def passthrough_masks(masks_json_path: Path) -> list[dict]:
+def passthrough_masks(masks_json_path: Path, keep_ids: bool = False, rle_format: str = "compressed") -> list[dict]:
     """Copy every instance in masks_json_path through unchanged (same mask/RLE), tagged with
-    provenance {"source": "original"}, re-indexed 0..N-1 -- same shape process_frame's "untouched"
-    instances get, for a frame with no worklist actions at all."""
+    provenance {"source": "original"}, re-indexed 0..N-1 (or keeping original instance_idx with
+    keep_ids=True) -- same shape process_frame's "untouched" instances get, for a frame with no
+    worklist actions at all."""
     instances = load_instances(masks_json_path)
     out = [
-        build_output_instance(inst["mask"], {"source": "original", "orig_idx": inst["instance_idx"]})
+        build_output_instance(
+            inst["mask"], {"source": "original", "orig_idx": inst["instance_idx"]}, rle_format=rle_format
+        )
         for inst in instances
     ]
-    for i, inst in enumerate(out):
-        inst["instance_idx"] = i
+    if keep_ids:
+        for inst, orig in zip(out, instances):
+            inst["instance_idx"] = orig["instance_idx"]
+    else:
+        for i, inst in enumerate(out):
+            inst["instance_idx"] = i
     return out
 
 
@@ -317,6 +439,15 @@ def main(argv=None):
     ap.add_argument("--text-prompt", default="person")
     ap.add_argument("--iou-match", type=float, default=0.5, help="min box IoU to match a text candidate to a proposed box/old mask")
     ap.add_argument("--dilate", type=float, default=0.10, help="fraction of box width/height to grow a resegment box prompt by, per side")
+    ap.add_argument("--keep-ids", action="store_true",
+                     help="output instances keep their original instance_idx (SAM3 track id) instead of "
+                          "being re-indexed 0..N-1: kept/resegmented instances keep their orig_idx, "
+                          "'add' instances get max(existing ids)+1, +2, .... Default (off) re-indexes "
+                          "0..N-1 for backwards compatibility.")
+    ap.add_argument("--rle-format", choices=["compressed", "intlist"], default="compressed",
+                     help="'compressed' (default): pycocotools-style LEB128 counts string, byte-compatible "
+                          "with the input files. 'intlist': uncompressed int-list counts, required by "
+                          "vision-llm-ann-generator/tracks.py's rle_decode (it rejects compressed strings).")
     ap.add_argument("--log", default="corrections.jsonl")
     ap.add_argument("--limit", type=int, default=None, help="process at most N worklist rows")
     ap.add_argument("--dry-run", action="store_true", help="run the model and compute corrections but do not write <out-dir> or --log")
@@ -402,7 +533,7 @@ def main(argv=None):
                 print(f"correct.py: passthrough: no masks_json for {stem}, skipping", file=sys.stderr)
                 n_pass_error += 1
                 continue
-            out_instances = passthrough_masks(masks_json_path)
+            out_instances = passthrough_masks(masks_json_path, keep_ids=args.keep_ids, rle_format=args.rle_format)
             if not args.dry_run:
                 with open(out_path, "w") as f:
                     json.dump(out_instances, f)
