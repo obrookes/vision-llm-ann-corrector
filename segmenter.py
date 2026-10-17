@@ -10,7 +10,7 @@ Exposes:
     FakeSegmenter(...)          # same interface, returns synthetic rectangles; no sam3/torch import
     Candidate                    # {mask: bool (H, W) np.ndarray, box_xywh: pixel xyxy [x0,y0,x1,y1], score: float}
 
-SAM3 API as installed (sam3 0.1.0, checked inside $SCRATCH/containers/sam3.sif on the login node --
+SAM3 API as installed (sam3 0.1.0, checked inside $PROJECTDIR/obrookes/containers/sam3.sif on the login node --
 CPU-only `import inspect; inspect.getsource(...)` of the modules below, no model build/GPU use):
 
     from sam3.model_builder import build_sam3_video_predictor

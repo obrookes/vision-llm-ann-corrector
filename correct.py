@@ -2,7 +2,7 @@
 
     python correct.py --worklist outputs/worklist_calib.jsonl \\
         --frames-dir $SCRATCH/frames --masks-dir $SCRATCH/masks --out-dir $SCRATCH/masks_v2 \\
-        --checkpoint $SCRATCH/weights/sam3/sam3-safari-pos.pt \\
+        --checkpoint $PROJECTDIR/obrookes/model-weights/sam3/sam3-safari-pos.pt \\
         [--min-confidence high|low] [--text-prompt person] [--iou-match 0.5] [--dilate 0.10] \\
         [--keep-ids] [--rle-format compressed|intlist] \\
         [--log corrections.jsonl] [--limit N] [--dry-run] [--fake] [--device cuda] \\

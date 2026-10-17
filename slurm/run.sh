@@ -8,7 +8,7 @@
 cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 WORKLIST="${WORKLIST:-outputs/worklist_calib.jsonl}"
-CHECKPOINT="${CHECKPOINT:-$SCRATCH/weights/sam3/sam3-safari-pos.pt}"
+CHECKPOINT="${CHECKPOINT:-$PROJECTDIR/obrookes/model-weights/sam3/sam3-safari-pos.pt}"
 FRAMES_DIR="${FRAMES_DIR:-$SCRATCH/frames}"
 MASKS_DIR="${MASKS_DIR:-$SCRATCH/masks}"
 OUT_DIR="${OUT_DIR:-$SCRATCH/masks_v2}"
@@ -17,23 +17,23 @@ MIN_CONFIDENCE="${MIN_CONFIDENCE:-low}"
 IOU_MATCH="${IOU_MATCH:-0.5}"
 DILATE="${DILATE:-0.10}"
 
-SIF="${SIF:-$SCRATCH/containers/sam3.sif}"
-[ -e "$SIF" ] || SIF="$SCRATCH/containers/sam3-sandbox"   # login-node mksquashfs fails (pids limit); sandbox works too
+SIF="${SIF:-$PROJECTDIR/obrookes/containers/sam3.sif}"
+[ -e "$SIF" ] || SIF="$PROJECTDIR/obrookes/containers/sam3-sandbox"   # login-node mksquashfs fails (pids limit); sandbox works too
 if [ ! -e "$SIF" ]; then
     echo "run.sh: no container image found." >&2
-    echo "  looked for: \$SCRATCH/containers/sam3.sif and \$SCRATCH/containers/sam3-sandbox" >&2
+    echo "  looked for: \$PROJECTDIR/obrookes/containers/sam3.sif and \$PROJECTDIR/obrookes/containers/sam3-sandbox" >&2
     echo "  (built by vision-llm-ann-generator/container/; see its README.md)" >&2
     exit 1
 fi
 
 N="${SLURM_ARRAY_TASK_COUNT:-1}"; I="${SLURM_ARRAY_TASK_ID:-0}"
-mkdir -p outputs/shards "$OUT_DIR" "$SCRATCH/hf-cache" "$SCRATCH/torch-cache" "$SCRATCH/triton-cache"
+mkdir -p outputs/shards "$OUT_DIR" "$PROJECTDIR/obrookes/model-weights/hf-cache" "$SCRATCH/torch-cache" "$SCRATCH/triton-cache"
 SHARD="outputs/shards/$(basename "$WORKLIST" .jsonl)_${I}_of_${N}.jsonl"
 awk -v n="$N" -v i="$I" 'NR % n == i' "$WORKLIST" > "$SHARD"
 
 LOG="${LOG:-outputs/corrections_${I}_of_${N}.jsonl}"
 
-export APPTAINERENV_HF_HOME="$SCRATCH/hf-cache"
+export APPTAINERENV_HF_HOME="$PROJECTDIR/obrookes/model-weights/hf-cache"
 export APPTAINERENV_HF_HUB_OFFLINE=1
 export APPTAINERENV_TMPDIR=/tmp
 export APPTAINERENV_PYTHONUNBUFFERED=1
@@ -59,7 +59,7 @@ echo "== run.sh: WORKLIST=$SHARD CHECKPOINT=$CHECKPOINT OUT_DIR=$OUT_DIR TEXT_PR
 
 START=$(date +%s)
 
-apptainer exec --nv --bind "/lus,/scratch,$HOME" "$SIF" \
+apptainer exec --nv --bind "/lus,/scratch,/projects,$HOME" "$SIF" \
     python3 correct.py \
         --worklist "$SHARD" \
         --frames-dir "$FRAMES_DIR" \

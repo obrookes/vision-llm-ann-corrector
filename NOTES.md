@@ -7,7 +7,7 @@ Working notes for this repo (vision-llm-ann-corrector). See README.md for the de
 - `$SCRATCH/envs/vlm-verify/bin/python`: numpy 2.5.2, opencv-python (cv2) 5.0.0, PIL -- no
   pycocotools, no torch/sam3. Used to run `tests/` and any `--fake`/`--dry-run` invocation of
   `correct.py`. `pip install pytest` was needed into this env (not present initially).
-- `$SCRATCH/containers/sam3.sif`: has sam3 0.1.0 (`/usr/local/lib/python3.12/dist-packages/sam3`)
+- `$PROJECTDIR/obrookes/containers/sam3.sif`: has sam3 0.1.0 (`/usr/local/lib/python3.12/dist-packages/sam3`)
   and pycocotools. `apptainer exec` (no `--nv`, CPU-only) works fine for source inspection
   (`import inspect; inspect.getsource(...)`) and for confirming the pycocotools RLE-encoder
   agreement test -- neither builds a model or touches a GPU. Compute nodes are offline for this
@@ -15,7 +15,7 @@ Working notes for this repo (vision-llm-ann-corrector). See README.md for the de
 
 ## SAM3 API, verified against the installed package (not just the generator repo's docstring)
 
-`apptainer exec $SCRATCH/containers/sam3.sif python3 -c 'import inspect; import
+`apptainer exec $PROJECTDIR/obrookes/containers/sam3.sif python3 -c 'import inspect; import
 sam3.model.sam3_base_predictor as m; print(inspect.getsource(m))'` (and the same for
 `sam3.model.sam3_video_inference`, `sam3.model_builder`) confirms:
 
@@ -66,7 +66,7 @@ sam3.model.sam3_base_predictor as m; print(inspect.getsource(m))'` (and the same
 `rleToString`/`rleFrString` variable-length signed integer coding by hand (5 bits/byte, bit 0x20
 continuation, delta-coded against the count two positions back). Verified byte-identical to
 `pycocotools.mask.encode` inside the container on random test data
-(`apptainer exec $SCRATCH/containers/sam3.sif python3 -c '...'`, see the repo's git history /
+(`apptainer exec $PROJECTDIR/obrookes/containers/sam3.sif python3 -c '...'`, see the repo's git history /
 session transcript for the exact command) -- `tests/test_correct.py`'s
 `test_rle_encode_agrees_with_pycocotools_when_available` covers this automatically wherever
 pycocotools is importable, and skips otherwise (true on the login-node python used to actually run
